@@ -34,5 +34,5 @@ help: |
     · pysilk（可选）：启用后可自行编码 Tencent SILK，QQ 语音兼容性更好
 version: v1.0.0
 author: CodeSmith
-repo: https://github.com/zyw052/astrbot_plugin_mimotts
+repo: https://github.com/Zyw052/astrbot_plugin_mimotts
 astrbot_version: ">=4.13.0"
