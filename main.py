@@ -102,26 +102,35 @@ COMMON_AUDIO_TAGS = (
 
 # `<style>...</style>` / `<风格>...</风格>`（Issue #7957 兼容写法）
 _STYLE_TAG_PATTERNS = (
-    re.compile(r"<\\s*style\\s*>(.*?)<\\s*/\\s*style\\s*>", re.DOTALL | re.IGNORECASE),
-    re.compile(r"<\\s*风格\\s*>(.*?)<\\s*/\\s*风格\\s*>", re.DOTALL),
-    re.compile(r"<\\s*style\\s*>(.*)$", re.DOTALL | re.IGNORECASE),  # 只有开标签的容错
+    re.compile(r"<\s*style\s*>(.*?)<\s*/\s*style\s*>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\s*风格\s*>(.*?)<\s*/\s*风格\s*>", re.DOTALL),
+    re.compile(r"<\s*style\s*>(.*)$", re.DOTALL | re.IGNORECASE),  # 只有开标签的容错
 )
 
 # 正文开头的 `(风格)` / `（风格）`（不含 `[..]`：方括号优先解释为动作标签）
-_LEADING_STYLE_PATTERN = re.compile(r"^\\s*[\\(（]([^()（）]{1,40})[\\)）]\\s*")
+_LEADING_STYLE_PATTERN = re.compile(r"^\s*[\(（]([^()（）]{1,40})[\)）]\s*")
 
 # 任意位置的 [动作标签]（半角/全角方括号）
-_AUDIO_TAG_PATTERN = re.compile(r"[\\[［]([^\\[\\]［］\\s]{1,12})[\\]］]")
+_AUDIO_TAG_PATTERN = re.compile(r"[\[［]([^\[\]［］\s]{1,12})[\]］]")
 
 # 需要从朗读文本中剔除的内容
 _CODE_FENCE_PATTERN = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_PATTERN = re.compile(r"`([^`]*)`")
-_URL_PATTERN = re.compile(r"https?://\\S+")
-_MD_IMAGE_PATTERN = re.compile(r"!\\[[^\\]]*\\]\\([^)]*\\)")
-_MD_LINK_PATTERN = re.compile(r"\\[([^\\]]*)\\]\\([^)]*\\)")
+_URL_PATTERN = re.compile(r"https?://\S+")
+_MD_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_LINK_PATTERN = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _HTML_TAG_PATTERN = re.compile(r"</?[A-Za-z][^>]{0,60}>")
-_WS_PATTERN = re.compile(r"[ \\t\\u3000]+")
-_MULTI_NL_PATTERN = re.compile(r"\\n{2,}")
+
+# 空白字符用显式码点构造，避免源码中直接出现控制字符转义
+_TAB = chr(9)
+_IDEOGRAPHIC_SPACE = chr(0x3000)
+_CR = chr(13)
+_LF = chr(10)
+# 引号集合（单引号 + 双引号），用于 strip 首尾引号
+_QUOTES = chr(39) + chr(34)
+
+_WS_PATTERN = re.compile(f"[ {_TAB}{_IDEOGRAPHIC_SPACE}]+")
+_MULTI_NL_PATTERN = re.compile(_LF + "{2,}")
 
 
 # --------------------------------------------------------------------------- #
@@ -142,14 +151,14 @@ def clean_text(raw: str) -> str:
         return ""
     text = str(raw)
     text = _CODE_FENCE_PATTERN.sub(" ", text)
-    text = _INLINE_CODE_PATTERN.sub(r"\\1", text)
+    text = _INLINE_CODE_PATTERN.sub(r"\1", text)
     text = _MD_IMAGE_PATTERN.sub(" ", text)
-    text = _MD_LINK_PATTERN.sub(r"\\1", text)
+    text = _MD_LINK_PATTERN.sub(r"\1", text)
     text = _URL_PATTERN.sub(" ", text)
     text = _HTML_TAG_PATTERN.sub(" ", text)
-    text = text.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+    text = text.replace(_CR + _LF, _LF).replace(_CR, _LF)
     text = _WS_PATTERN.sub(" ", text)
-    text = _MULTI_NL_PATTERN.sub("\\n", text)
+    text = _MULTI_NL_PATTERN.sub("\n", text)
     return text.strip()
 
 
@@ -293,7 +302,7 @@ def parse_env_file(
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        values[key.strip().upper()] = value.strip().strip("'\\"")
+        values[key.strip().upper()] = value.strip().strip(_QUOTES)
 
     for key in keys:
         value = values.get(key.upper(), "")
@@ -301,7 +310,7 @@ def parse_env_file(
             return value
     # 退化：整个文件就是一个裸 Key
     return (
-        content.strip().strip("'\\"") if len(content.strip().splitlines()) == 1 else ""
+        content.strip().strip(_QUOTES) if len(content.strip().splitlines()) == 1 else ""
     )
 
 
@@ -668,7 +677,7 @@ class MiMoTTSPlugin(Star):
         if value is None:
             return []
         if isinstance(value, str):
-            items = re.split(r"[,\\s]+", value.strip())
+            items = re.split(r"[,\s]+", value.strip())
         elif isinstance(value, (list, tuple, set)):
             items = [str(item) for item in value]
         else:
@@ -1152,7 +1161,7 @@ class MiMoTTSPlugin(Star):
         if not candidate:
             current = self.state.get(session_id, "voice", self.default_voice)
             yield event.plain_result(
-                f"当前音色：{current}\\n可选：{'、'.join(VOICE_CHOICES)}\\n"
+                f"当前音色：{current}\n可选：{'、'.join(VOICE_CHOICES)}\n"
                 f"用法：/mimo音色 冰糖（发送“重置”恢复默认）"
             )
             return
@@ -1165,7 +1174,7 @@ class MiMoTTSPlugin(Star):
         matched = next((v for v in VOICE_CHOICES if v.lower() == candidate.lower()), "")
         if not matched:
             yield event.plain_result(
-                f"未知音色：{candidate}\\n可选：{'、'.join(VOICE_CHOICES)}"
+                f"未知音色：{candidate}\n可选：{'、'.join(VOICE_CHOICES)}"
             )
             return
 
@@ -1185,8 +1194,8 @@ class MiMoTTSPlugin(Star):
                 self.state.get(session_id, "style") or self.style_prefix or "（未设置）"
             )
             yield event.plain_result(
-                f"当前默认风格：{current}\\n"
-                "示例：/mimo风格 温柔 撒娇 → 合成时会自动加 `(温柔 撒娇)` 前缀\\n"
+                f"当前默认风格：{current}\n"
+                "示例：/mimo风格 温柔 撒娇 → 合成时会自动加 `(温柔 撒娇)` 前缀\n"
                 "发送“重置”可恢复插件默认。"
             )
             return
@@ -1221,21 +1230,21 @@ class MiMoTTSPlugin(Star):
             f"· 微信语音策略：{self.weixin_voice_mode}；QQ 录音格式：{self.qq_record_format}",
             f"· 临时音频：{cache_files} 个（TTL {self.temp_ttl_seconds}s）",
         ]
-        yield event.plain_result("\\n".join(lines))
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("mimo帮助", alias={"mimo_help"})
     async def cmd_mimo_help(self, event: AstrMessageEvent):
         """显示 MiMo TTS 使用帮助"""
         yield event.plain_result(
-            "【MiMo TTS 帮助】\\n"
-            "· /mimo <文本>          合成语音条\\n"
-            "· /mimo引用             朗读被引用的消息\\n"
-            "· /mimo音色 [名称]      查看/切换音色\\n"
-            "· /mimo风格 [风格词]    查看/设置默认风格\\n"
-            "· /mimo状态             查看运行状态\\n"
-            "\\n文本语法（官方协议）：\\n"
-            "· 风格：`(温柔 撒娇)你好呀`，或写 `<style>温柔 撒娇</style>你好呀`（自动转换）\\n"
-            "· 动作标签：`你好呀[轻笑]`、`唉[叹气]`\\n"
+            "【MiMo TTS 帮助】\n"
+            "· /mimo <文本>          合成语音条\n"
+            "· /mimo引用             朗读被引用的消息\n"
+            "· /mimo音色 [名称]      查看/切换音色\n"
+            "· /mimo风格 [风格词]    查看/设置默认风格\n"
+            "· /mimo状态             查看运行状态\n"
+            "\n文本语法（官方协议）：\n"
+            "· 风格：`(温柔 撒娇)你好呀`，或写 `<style>温柔 撒娇</style>你好呀`（自动转换）\n"
+            "· 动作标签：`你好呀[轻笑]`、`唉[叹气]`\n"
             f"· 内置音色：{'、'.join(VOICE_CHOICES)}"
         )
 
