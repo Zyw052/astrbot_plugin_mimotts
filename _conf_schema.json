@@ -1,0 +1,160 @@
+{
+  "enable": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后指令与 LLM 工具都不再生效"
+  },
+  "api_key": {
+    "description": "MiMo API Key",
+    "type": "string",
+    "default": "",
+    "obvious_hint": true,
+    "hint": "留空时依次回落：环境变量 MIMO_API_KEY → credentials_path 指向的文件。格式 sk-xxxxx"
+  },
+  "credentials_path": {
+    "description": "凭证文件路径（api_key 留空时读取）",
+    "type": "string",
+    "default": "/data/apps/credentials/mimo.env",
+    "hint": "支持 .env 格式（MIMO_API_KEY=sk-xxx）或仅一行裸 Key"
+  },
+  "api_url": {
+    "description": "API 地址",
+    "type": "string",
+    "default": "https://api.xiaomimimo.com/v1/chat/completions",
+    "hint": "OpenAI 兼容协议；Token Plan / 批量推理需换成对应 Base URL"
+  },
+  "model": {
+    "description": "TTS 模型",
+    "type": "string",
+    "default": "mimo-v2.5-tts",
+    "options": [
+      "mimo-v2.5-tts",
+      "mimo-v2.5-tts-voicedesign",
+      "mimo-v2.5-tts-voiceclone"
+    ],
+    "hint": "mimo-v2.5-tts=内置音色；voicedesign=文字描述生成音色；voiceclone=音频样本复刻音色"
+  },
+  "default_voice": {
+    "description": "默认音色",
+    "type": "string",
+    "default": "冰糖",
+    "options": [
+      "mimo_default",
+      "冰糖",
+      "茉莉",
+      "苏打",
+      "白桦",
+      "Mia",
+      "Chloe",
+      "Milo",
+      "Dean"
+    ],
+    "hint": "仅 mimo-v2.5-tts 生效；mimo_default 在国内集群为冰糖，其它集群为 Mia"
+  },
+  "voice_design_prompt": {
+    "description": "VoiceDesign 音色描述",
+    "type": "text",
+    "default": "温婉的年轻女声，音色清亮柔和，语气自然亲切，语速偏慢，带一点撒娇的尾音。",
+    "hint": "mimo-v2.5-tts-voicedesign 必填：user 消息内容即音色描述（不发音），建议 1-4 句"
+  },
+  "voice_design_optimize_text": {
+    "description": "VoiceDesign 智能润色文本",
+    "type": "bool",
+    "default": false,
+    "hint": "对应官方 optimize_text_preview；开启后模型会润色待播报文本，可能改动原文"
+  },
+  "voice_sample_path": {
+    "description": "VoiceClone 音色样本路径",
+    "type": "string",
+    "default": "",
+    "hint": "mimo-v2.5-tts-voiceclone 必填：本地 mp3/wav 文件绝对路径，base64 后不得超过 10MB"
+  },
+  "voice_sample_format": {
+    "description": "VoiceClone 样本格式",
+    "type": "string",
+    "default": "mp3",
+    "options": ["mp3", "wav"],
+    "hint": "仅当样本文件无扩展名时用于推断 MIME"
+  },
+  "style_prefix": {
+    "description": "默认风格前缀",
+    "type": "string",
+    "default": "",
+    "hint": "例如「温柔 撒娇」，会以官方 `(温柔 撒娇)正文` 形式放在 assistant 文本最开头"
+  },
+  "style_instruction": {
+    "description": "默认自然语言风格指令",
+    "type": "text",
+    "default": "用自然亲切的口吻说话，像和熟人聊天，语速中等偏慢，句尾语气柔和。",
+    "hint": "放在 role=user 的 content，用于导演式风格控制（不会被朗读出来）"
+  },
+  "enable_audio_tags": {
+    "description": "启用动作标签",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 `[轻笑]`、`[叹气]`、`[撒娇]`、`[吸气]` 等标签会传给模型；关闭则自动剥离"
+  },
+  "target_platforms": {
+    "description": "启用的平台",
+    "type": "list",
+    "default": ["aiocqhttp", "weixin_oc", "qq_official"],
+    "hint": "平台适配器名：aiocqhttp=NapCat/OneBot QQ，weixin_oc=个人微信，qq_official=QQ 官方机器人；留空表示全部"
+  },
+  "weixin_voice_mode": {
+    "description": "微信语音发送策略",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "native_voice", "file"],
+    "hint": "auto=先试原生语音条，失败降级 mp3 文件；native_voice=只发语音条（失败报错）；file=直接发音频文件"
+  },
+  "weixin_voice_upload_type": {
+    "description": "微信语音上传 media_type",
+    "type": "int",
+    "default": 3,
+    "hint": "微信 CDN 上传类型（1=图片 2=视频 3=文件）；语音条实验通道默认沿用 3，异常时无需改动"
+  },
+  "qq_record_format": {
+    "description": "QQ 录音格式",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "silk", "wav"],
+    "hint": "auto=有 pysilk 就编码 SILK，否则发 24kHz WAV 由 NapCat 转码；silk/wav=强制指定"
+  },
+  "send_text_caption": {
+    "description": "同时发送文字",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后先发一条文字，再发语音"
+  },
+  "max_text_length": {
+    "description": "单次朗读最大字数",
+    "type": "int",
+    "default": 300,
+    "hint": "超出会截断并记录日志；<=0 表示不限制"
+  },
+  "request_timeout": {
+    "description": "请求超时（秒）",
+    "type": "int",
+    "default": 90,
+    "hint": "长文本合成耗时会增加，建议 60-120"
+  },
+  "enable_llm_tool": {
+    "description": "启用 LLM 工具",
+    "type": "bool",
+    "default": true,
+    "hint": "注册 mimo_speak 工具，让模型能主动发语音条"
+  },
+  "temp_ttl_seconds": {
+    "description": "临时音频保留秒数",
+    "type": "int",
+    "default": 900,
+    "hint": "发送后延迟删除，启动时清扫过期文件；缓存目录：data/plugin_data/astrbot_plugin_mimotts/cache"
+  },
+  "debug": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "打印请求体摘要（assistant 文本前 80 字）与 audio 参数"
+  }
+}
