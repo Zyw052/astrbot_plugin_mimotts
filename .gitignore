@@ -1,0 +1,82 @@
+# ============================================================
+# astrbot_plugin_mimotts - Git 忽略规则
+# 原则：敏感凭证、本地缓存、生成的音频产物一律不入库
+# ============================================================
+
+# ---------- 敏感凭证 ----------
+*.env
+.env
+.env.*
+credentials/
+credentials*.json
+*_token.json
+secrets.yaml
+secrets.yml
+*.key
+*.pem
+*.p12
+*.pfx
+
+# ---------- 本地缓存与临时目录 ----------
+cache/
+.cache/
+tmp/
+temp/
+tests/tmp/
+tests/temp/
+*.tmp
+*.bak
+*.swp
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------- 音频 / 语音产物（体积大且为运行期生成） ----------
+*.wav
+*.mp3
+*.silk
+*.amr
+*.ogg
+*.flac
+*.m4a
+*.pcm
+*.aac
+*.opus
+voice_samples/
+
+# ---------- Python 运行产物 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.Python
+build/
+dist/
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+
+# ---------- 测试与检查工具缓存 ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---------- 编辑器 / 操作系统杂项 ----------
+.vscode/
+.idea/
+*.sublime-*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 其他 ----------
+*.zip
+*.tar.gz
