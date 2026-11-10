@@ -15,6 +15,17 @@
 4. 临时音频文件统一落在 `data/plugin_data/astrbot_plugin_mimotts/cache/`，
    按 TTL 延迟清理，并在插件启动时清扫过期文件。
 
+v1.1.0 新增（全自动语音架构）：
+5. 全局自动发声钩子：`@filter.on_decorating_result()` 拦截 LLM 最终回复文本，
+   按「概率 / 字数区间 / 去 Markdown」三重闸门判断是否合成语音，并把语音段
+   拼接进消息链（文字+语音并存，或纯语音），无需模型主动调用工具；
+6. 隐式导演提示词注入：`@filter.on_llm_request()` 幂等追加轻量指导词，
+   教 LLM 使用 `(风格)` 前缀与 `[轻笑]` 等动作标签，不破坏原有人设；
+7. 原生 TTS 凭据复用：优先解析 AstrBot `cmd_config.json` 中已配置的 MiMo TTS
+   provider（api_key / api_base），实现免二次配 Key 的开箱即用；
+8. 防双重发声：检测到原生 TTS 仍启用时，在「文字+语音」模式下自动让位并告警，
+   避免同一句话被合成两次（双重扣费）。
+
 依据规范：
 - 插件结构 / metadata / 配置：astrbot-plugin-dev SKILL §2 / §3 / §6；
 - 指令注册 `@filter.command`：§4；
@@ -31,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import random
 import re
 import shutil
 import time
@@ -40,10 +53,12 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import File, Plain, Record
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.star.filter.command import GreedyStr
 
 # --------------------------------------------------------------------------- #
@@ -54,6 +69,29 @@ PLUGIN_NAME = "astrbot_plugin_mimotts"
 
 DEFAULT_API_URL = "https://api.xiaomimimo.com/v1/chat/completions"
 DEFAULT_CREDENTIALS_PATH = "/data/apps/credentials/mimo.env"
+
+# ---- 自动发声 / 提示词注入 ----
+
+#: 注入到 system_prompt 的幂等标记：已存在则不再重复注入
+PROMPT_INJECTION_MARKER = "[MiMo-TTS]"
+
+#: 默认导演提示词（教 LLM 使用 MiMo 官方风格/动作标签语法）
+DEFAULT_PROMPT_INJECTION = (
+    "你可以在回复开头附带 (风格) 前缀（如 开心/温柔/撒娇/低语/严肃），"
+    "并在语句停顿处适度插入 [轻笑]、[叹气]、[撒娇]、[吸气] 等动作标签，"
+    "使语气更加生动逼真。注意：正文不要包含 Markdown 代码块或复杂排版。"
+)
+
+#: 事件级标记：本轮已由 mimo_speak 工具发过语音，自动钩子不再重复发声
+HOOK_SPOKEN_EXTRA_KEY = "mimotts_auto_hook_spoken"
+
+#: 发送模式
+SEND_MODE_WITH_TEXT = "voice_with_text"
+SEND_MODE_VOICE_ONLY = "voice_only"
+SEND_MODES = (SEND_MODE_WITH_TEXT, SEND_MODE_VOICE_ONLY)
+
+#: 自动钩子监听的原生 TTS 冲突告警节流（秒）
+NATIVE_TTS_WARN_INTERVAL = 300.0
 
 MODEL_TTS = "mimo-v2.5-tts"
 MODEL_VOICEDESIGN = "mimo-v2.5-tts-voicedesign"
@@ -315,6 +353,331 @@ def parse_env_file(
 
 
 # --------------------------------------------------------------------------- #
+# 自动发声 / 提示词注入 / 原生配置复用（纯函数，便于离线单测）
+# --------------------------------------------------------------------------- #
+
+# Markdown 结构标记（用于朗读前的清理，避免把代码/链接/排版读出来）
+_SPEECH_UNCLOSED_FENCE = re.compile(r"```.*$", re.DOTALL)
+_SPEECH_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_SPEECH_BOLD = re.compile(r"(\*\*|__)(.+?)\1", re.DOTALL)
+_SPEECH_ITALIC_STAR = re.compile(r"(?<!\*)\*(?!\*)([^*\n]+)\*(?!\*)")
+_SPEECH_ITALIC_UNDER = re.compile(r"(?<!_)_(?!_)([^_\n]+)_(?!_)")
+_SPEECH_STRIKE = re.compile(r"~~(.+?)~~", re.DOTALL)
+_SPEECH_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)
+_SPEECH_QUOTE = re.compile(r"^\s{0,3}>\s?", re.MULTILINE)
+_SPEECH_LIST = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+", re.MULTILINE)
+_SPEECH_HR = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$", re.MULTILINE)
+_SPEECH_TABLE_SEP = re.compile(
+    r"^\s*\|?(?:\s*:?-{2,}:?\s*\|)+\s*$", re.MULTILINE
+)
+_SPEECH_TABLE_PIPE = re.compile(r"\s*\|\s*")
+_SPEECH_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>~])")
+_SPEECH_WS = re.compile(r"[ \t\u3000]+")
+_SPEECH_NEWLINE_WRAP = re.compile(r"[ \t\u3000]*\n[ \t\u3000]*")
+
+
+def strip_markdown_for_speech(raw: str) -> str:
+    """把 LLM 回复清洗成适合朗读的纯文本。
+
+    处理范围：
+    - 代码块 / 行内代码（保留行内代码文字，丢弃围栏）；
+    - 图片、链接（保留链接文字，丢弃 URL）；
+    - 加粗 `**x**` / `__x__`、斜体 `*x*` / `_x_`、删除线 `~~x~~`；
+    - 标题 `#`、引用 `>`、列表 `- 1.`、分隔线、表格竖线；
+    - HTML 注释与标签、Markdown 转义反斜杠；
+    - 连续空白压缩。
+    注意：`[轻笑]` 这类动作标签会**原样保留**，交给 MiMo 模型处理。
+
+    Args:
+        raw: LLM 原始回复文本。
+
+    Returns:
+        适合朗读的纯文本（可能为空）。
+    """
+    if not raw:
+        return ""
+    text = str(raw)
+    text = _SPEECH_HTML_COMMENT.sub(" ", text)
+    text = _CODE_FENCE_PATTERN.sub(" ", text)
+    text = _SPEECH_UNCLOSED_FENCE.sub(" ", text)
+    text = _INLINE_CODE_PATTERN.sub(r"\1", text)
+    text = _MD_IMAGE_PATTERN.sub(" ", text)
+    text = _MD_LINK_PATTERN.sub(r"\1", text)
+    text = _SPEECH_BOLD.sub(r"\2", text)
+    text = _SPEECH_STRIKE.sub(r"\1", text)
+    text = _SPEECH_ITALIC_STAR.sub(r"\1", text)
+    text = _SPEECH_ITALIC_UNDER.sub(r"\1", text)
+    text = _SPEECH_HEADING.sub("", text)
+    text = _SPEECH_QUOTE.sub("", text)
+    text = _SPEECH_LIST.sub("", text)
+    text = _SPEECH_HR.sub(" ", text)
+    text = _SPEECH_TABLE_SEP.sub(" ", text)
+    text = _SPEECH_TABLE_PIPE.sub(" ", text)
+    text = _SPEECH_ESCAPE.sub(r"\1", text)
+    text = _URL_PATTERN.sub(" ", text)
+    text = _HTML_TAG_PATTERN.sub(" ", text)
+    text = text.replace(_CR + _LF, _LF).replace(_CR, _LF)
+    text = _SPEECH_WS.sub(" ", text)
+    text = _SPEECH_NEWLINE_WRAP.sub("\n", text)
+    text = _MULTI_NL_PATTERN.sub("\n", text)
+    return text.strip()
+
+
+def speech_length(text: str) -> int:
+    """计算「有效发音长度」：忽略空白与动作标签。
+
+    动作标签（如 `[轻笑]`）本身不计入字数，但仍会传给模型发声，
+    因此 `[轻笑]嗯` 的有效长度是 1，`好的` 是 2。
+
+    Args:
+        text: 已清理的朗读文本。
+
+    Returns:
+        有效字符数。
+    """
+    if not text:
+        return 0
+    plain = strip_audio_tags(str(text))
+    return len("".join(plain.split()))
+
+
+def prepare_speech_candidate(
+    raw: str,
+    *,
+    min_len: int = 2,
+    max_len: int = 200,
+) -> tuple[str, str]:
+    """把 LLM 文本整理成可朗读候选，并给出「是否发声」的判断依据。
+
+    Args:
+        raw: LLM 原始回复文本（可含 Markdown）。
+        min_len: 最小有效字数，``<=0`` 表示不限制；低于则跳过。
+        max_len: 最大有效字数，``<=0`` 表示不限制；高于则跳过（不截断）。
+
+    Returns:
+        ``(clean_text, reason)``：
+        - ``reason`` 为空串 → 应当发声；
+        - ``reason`` 非空 → 跳过原因，``clean_text`` 仍返回清理结果便于日志。
+    """
+    clean = strip_markdown_for_speech(raw)
+    if not clean:
+        return "", "清理后没有可朗读的正文（可能只有代码/链接/图片）"
+    length = speech_length(clean)
+    if length <= 0:
+        return clean, "清理后没有可发音字符（可能只有动作标签）"
+    if min_len and min_len > 0 and length < min_len:
+        return clean, f"正文过短（{length} 字 < min_text_len={min_len}）"
+    if max_len and max_len > 0 and length > max_len:
+        return clean, f"正文过长（{length} 字 > max_text_len={max_len}），已跳过"
+    return clean, ""
+
+
+def roll_probability(probability: float, rng: random.Random | None = None) -> bool:
+    """按概率决定是否发声。
+
+    Args:
+        probability: 0.0 ~ 1.0；越界会被裁剪。
+        rng: 可注入的随机源（单测用固定种子）。
+
+    Returns:
+        True 表示本次应当发声。
+    """
+    try:
+        prob = float(probability)
+    except (TypeError, ValueError):
+        prob = 1.0
+    prob = max(0.0, min(prob, 1.0))
+    if prob <= 0.0:
+        return False
+    if prob >= 1.0:
+        return True
+    generator = rng or random
+    return generator.random() < prob
+
+
+def inject_system_prompt(
+    system_prompt: str,
+    directive: str,
+    marker: str = PROMPT_INJECTION_MARKER,
+) -> str:
+    """把导演提示词幂等追加到 system_prompt 末尾。
+
+    幂等策略：``system_prompt`` 中已含 ``marker`` 时原样返回，
+    因此不会在多轮请求里重复堆叠，也不会破坏原有人设文本。
+
+    Args:
+        system_prompt: 现有系统提示词（可能为空）。
+        directive: 要注入的指导词。
+        marker: 幂等标记。
+
+    Returns:
+        注入后的系统提示词。
+    """
+    base = system_prompt or ""
+    text = (directive or "").strip()
+    if not text:
+        return base
+    if marker and marker in base:
+        return base
+    block = f"{marker} {text}" if marker else text
+    if not base.strip():
+        return block
+    return f"{base.rstrip()}\n\n{block}"
+
+
+def normalize_api_endpoint(api_base: str) -> str:
+    """把 provider 的 api_base 归一化为 chat/completions 端点。
+
+    AstrBot 原生 MiMo TTS provider 的 ``api_base`` 形如
+    ``https://api.xiaomimimo.com/v1``，而本插件使用 OpenAI 兼容的
+    ``/chat/completions`` 端点，这里统一补齐。
+
+    Args:
+        api_base: provider 配置中的 api_base 或完整端点。
+
+    Returns:
+        完整的 chat/completions URL。
+    """
+    base = (api_base or "").strip()
+    if not base:
+        return DEFAULT_API_URL
+    if base.rstrip("/").endswith("/chat/completions"):
+        return base.rstrip("/")
+    return base.rstrip("/") + "/chat/completions"
+
+
+def parse_native_tts_config(data: dict) -> dict[str, str]:
+    """从 AstrBot 全局配置数据中提取 MiMo TTS provider 的凭据。
+
+    查找策略：
+    1. 优先 ``provider`` 列表（运行时实际生效的配置）；
+    2. 回退 ``provider_sources``（服务来源模板）；
+    3. 命中条件：``id/type/provider/model`` 任一含 ``mimo``，且
+       ``provider_type`` 为空或为 ``text_to_speech``。
+
+    Args:
+        data: 已解析的 ``cmd_config.json`` 字典。
+
+    Returns:
+        含 ``api_key`` / ``api_base`` / ``model`` / ``voice`` /
+        ``style_prompt`` / ``provider_id`` / ``tts_enabled`` /
+        ``tts_provider_id`` 的字典；未命中时各值为空串。
+    """
+    result: dict[str, str] = {
+        "api_key": "",
+        "api_base": "",
+        "model": "",
+        "voice": "",
+        "style_prompt": "",
+        "provider_id": "",
+        "tts_enabled": "",
+        "tts_provider_id": "",
+        "provider_enabled": "",
+    }
+    if not isinstance(data, dict):
+        return result
+
+    tts_settings = data.get("provider_tts_settings") or {}
+    if isinstance(tts_settings, dict):
+        enabled = tts_settings.get("enable")
+        result["tts_enabled"] = "1" if bool(enabled) else "0"
+        result["tts_provider_id"] = str(tts_settings.get("provider_id") or "").strip()
+
+    def _iter_mimo(items: Any) -> list[dict]:
+        found: list[dict] = []
+        if not isinstance(items, (list, tuple)):
+            return found
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            blob = " ".join(
+                str(item.get(key, "")) for key in ("id", "type", "provider", "model")
+            ).lower()
+            if "mimo" not in blob:
+                continue
+            ptype = str(item.get("provider_type") or "").lower().strip()
+            if ptype and ptype != "text_to_speech":
+                continue
+            found.append(item)
+        return found
+
+    candidates = _iter_mimo(data.get("provider")) + _iter_mimo(
+        data.get("provider_sources")
+    )
+
+    for item in candidates:
+        if not result["api_key"]:
+            raw_key = str(item.get("api_key") or item.get("key") or "").strip()
+            # provider_sources 的 key 可能是 "['sk-xxx']" 形式，取第一个引号内值
+            if raw_key.startswith("["):
+                inner = raw_key.strip("[]").strip(_QUOTES).strip()
+                raw_key = inner.split(_QUOTES[0])[0] if inner else ""
+            raw_key = raw_key.strip(_QUOTES).strip()
+            if raw_key and " " not in raw_key:
+                result["api_key"] = raw_key
+        if not result["api_base"]:
+            result["api_base"] = str(item.get("api_base") or "").strip()
+        if not result["model"]:
+            result["model"] = str(item.get("model") or "").strip()
+        if not result["voice"]:
+            result["voice"] = str(item.get("mimo-tts-voice") or "").strip()
+        if not result["style_prompt"]:
+            result["style_prompt"] = str(
+                item.get("mimo-tts-style-prompt") or ""
+            ).strip()
+        if not result["provider_id"]:
+            result["provider_id"] = str(item.get("id") or "").strip()
+        if not result["provider_enabled"]:
+            enabled = item.get("enable")
+            if enabled is not None:
+                result["provider_enabled"] = "1" if bool(enabled) else "0"
+
+    return result
+
+
+def native_config_candidates(explicit_path: str = "") -> list[Path]:
+    """列出可能的 AstrBot 全局配置路径（按优先级去重）。
+
+    不写死绝对路径：优先使用 AstrBot 官方的 data 路径工具，
+    再根据 ``main.py`` 所在位置向上回溯，最后兜底当前工作目录。
+
+    Args:
+        explicit_path: 用户在插件配置中显式指定的配置文件路径。
+
+    Returns:
+        去重后的候选路径列表（不保证存在）。
+    """
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+
+    try:  # 官方路径工具（在 AstrBot 运行时可用）
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+        candidates.append(Path(get_astrbot_data_path()) / "cmd_config.json")
+    except Exception:  # noqa: BLE001 - 离线环境允许缺失
+        pass
+
+    here = Path(__file__).resolve()
+    # <root>/data/plugins/<plugin>/main.py -> data, <root>, ...
+    for parent in list(here.parents)[:6]:
+        candidates.append(parent / "cmd_config.json")
+        candidates.append(parent / "data" / "cmd_config.json")
+
+    candidates.append(Path.cwd() / "data" / "cmd_config.json")
+
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(path)
+    return ordered
+
+
+# --------------------------------------------------------------------------- #
 # 数据容器
 # --------------------------------------------------------------------------- #
 
@@ -474,8 +837,10 @@ class MiMoClient:
         api_key = self._plugin.resolve_api_key()
         if not api_key:
             raise MiMoTTSError(
-                "未找到 MiMo API Key：请在插件配置 api_key 填写，"
-                f"或将 MIMO_API_KEY 写入 {self._plugin.credentials_path}"
+                "未找到 MiMo API Key：请任选其一 —— "
+                "① 在 AstrBot 面板配置原生 MiMo TTS provider（本插件会自动复用）；"
+                "② 在插件配置 api_key 填写；"
+                f"③ 将 MIMO_API_KEY 写入 {self._plugin.credentials_path} 或环境变量。"
             )
 
         payload = {
@@ -492,7 +857,7 @@ class MiMoClient:
         }
 
         session = await self.get_session()
-        url = self._plugin.api_url
+        url = self._plugin.resolve_api_url()
         if self._plugin.debug:
             logger.info(
                 f"[mimotts] 请求 {url} model={payload['model']} "
@@ -601,10 +966,49 @@ class MiMoTTSPlugin(Star):
         self.temp_ttl_seconds: int = self._as_int(cfg.get("temp_ttl_seconds", 900), 900)
         self.debug: bool = self._as_bool(cfg.get("debug", False), False)
 
+        # ---- v1.1.0 自动语音架构配置
+        self.enable_auto_hook: bool = self._as_bool(
+            cfg.get("enable_auto_hook", True), True
+        )
+        self.auto_speak_probability: float = self._as_float(
+            cfg.get("auto_speak_probability", 0.6), 0.6
+        )
+        self.send_mode: str = (
+            str(cfg.get("send_mode") or SEND_MODE_WITH_TEXT).strip().lower()
+        )
+        if self.send_mode not in SEND_MODES:
+            logger.warning(
+                f"[mimotts] 未知 send_mode={self.send_mode!r}，已回退 {SEND_MODE_WITH_TEXT}"
+            )
+            self.send_mode = SEND_MODE_WITH_TEXT
+        self.default_style: str = str(cfg.get("default_style") or "").strip()
+        self.enable_prompt_injection: bool = self._as_bool(
+            cfg.get("enable_prompt_injection", True), True
+        )
+        self.prompt_injection_text: str = str(
+            cfg.get("prompt_injection_text") or ""
+        ).strip()
+        self.min_text_len: int = self._as_int(cfg.get("min_text_len", 2), 2)
+        self.max_text_len: int = self._as_int(cfg.get("max_text_len", 200), 200)
+        self.auto_hook_skip_if_native_tts: bool = self._as_bool(
+            cfg.get("auto_hook_skip_if_native_tts", True), True
+        )
+        self.native_config_path: str = str(
+            cfg.get("native_config_path") or ""
+        ).strip()
+
         self._api_key_override: str = str(cfg.get("api_key") or "").strip()
         self._optimize_text_preview = self._as_bool(
             cfg.get("voice_design_optimize_text", False), False
         )
+
+        # 原生 TTS 配置缓存（60s，避免每次合成/注入都读盘）
+        self._native_tts_cache: dict[str, str] | None = None
+        self._native_tts_ts: float = 0.0
+        # 概率判定随机源（单测可注入固定种子）
+        self._rng: random.Random = random.Random()
+        # 原生 TTS 冲突告警节流
+        self._native_tts_warn_ts: float = 0.0
 
         # ---- 目录与状态
         self.data_dir: Path = Path(StarTools.get_data_dir(PLUGIN_NAME))
@@ -622,6 +1026,13 @@ class MiMoTTSPlugin(Star):
             f"ffmpeg={'可用' if self._ffmpeg_path else '缺失'} "
             f"platforms={self.target_platforms or '全部'}"
         )
+        logger.info(
+            "[mimotts] 自动发声："
+            f"{'开启' if self.enable_auto_hook else '关闭'} "
+            f"prob={self.auto_speak_probability:.2f} mode={self.send_mode} "
+            f"len=[{self.min_text_len}, {self.max_text_len}] "
+            f"prompt注入={'开启' if self.enable_prompt_injection else '关闭'}"
+        )
 
     # ---------------- 生命周期 ----------------
 
@@ -637,8 +1048,30 @@ class MiMoTTSPlugin(Star):
             )
         if not self.resolve_api_key():
             logger.warning(
-                f"[mimotts] 未解析到 MiMo API Key（配置 api_key / 环境变量 / {self.credentials_path}）"
+                "[mimotts] 未解析到 MiMo API Key：请配置 AstrBot 原生 MiMo TTS provider、"
+                f"插件 api_key、环境变量 MIMO_API_KEY 或 {self.credentials_path}"
             )
+        else:
+            logger.info(
+                f"[mimotts] API Key 来源：{self.resolve_api_key_source()}；"
+                f"端点：{self.resolve_api_url()}"
+            )
+
+        # 原生 TTS 冲突提示（避免双重扣费 / 重合发声）
+        native = self.native_tts_info(force=True)
+        if native.get("tts_enabled") == "1":
+            if self.send_mode == SEND_MODE_WITH_TEXT and self.auto_hook_skip_if_native_tts:
+                logger.warning(
+                    "[mimotts] 检测到 AstrBot 原生 TTS 已启用（provider="
+                    f"{native.get('provider_id') or native.get('tts_provider_id')}）："
+                    "「文字+语音」模式下自动发声将让位以避免双重扣费。"
+                    "请按 README《如何关闭 AstrBot 原生 TTS》关闭原生 TTS。"
+                )
+            else:
+                logger.warning(
+                    "[mimotts] 检测到 AstrBot 原生 TTS 已启用；"
+                    "voice_only 模式本身不会与原生 TTS 重合，但建议关闭原生 TTS 以统一音色。"
+                )
 
     async def terminate(self) -> None:
         """插件停用时调用：关闭网络会话与后台清理任务。"""
@@ -672,6 +1105,14 @@ class MiMoTTSPlugin(Star):
             return default
 
     @staticmethod
+    def _as_float(value: Any, default: float) -> float:
+        """宽松浮点解析（并裁剪到 0.0~1.0 以外由调用方决定）。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _as_platform_list(value: Any) -> list[str]:
         """把配置里的平台列表归一化成小写平台名列表。"""
         if value is None:
@@ -684,16 +1125,108 @@ class MiMoTTSPlugin(Star):
             items = [str(value)]
         return [item.strip().lower() for item in items if item and item.strip()]
 
+    def native_tts_info(self, *, force: bool = False) -> dict[str, str]:
+        """读取并缓存 AstrBot 原生 MiMo TTS provider 配置。
+
+        缓存 60 秒，避免每次消息都解析 60KB+ 的 ``cmd_config.json``；
+        面板改配置后最多 1 分钟自动生效（``/mimo状态`` 会强制刷新）。
+
+        Args:
+            force: 忽略缓存，强制重新读盘。
+
+        Returns:
+            同 :func:`parse_native_tts_config`，额外含 ``config_path``。
+        """
+        now = time.time()
+        if (
+            not force
+            and self._native_tts_cache is not None
+            and now - self._native_tts_ts < 60
+        ):
+            return self._native_tts_cache
+
+        info: dict[str, str] = {}
+        # 显式指定路径时只认该文件（便于部署与单测隔离），否则自动探测
+        candidates = (
+            [Path(self.native_config_path)]
+            if self.native_config_path
+            else native_config_candidates()
+        )
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                # cmd_config.json 可能带 UTF-8 BOM
+                raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                logger.debug(f"[mimotts] 读取原生配置失败 {path}: {exc}")
+                continue
+            parsed = parse_native_tts_config(raw)
+            if parsed.get("api_key") or parsed.get("tts_provider_id"):
+                parsed["config_path"] = str(path)
+                info = parsed
+                break
+
+        self._native_tts_cache = info
+        self._native_tts_ts = now
+        return info
+
+    def native_tts_enabled(self) -> bool:
+        """原生 TTS 当前是否启用（用于避免双重扣费）。
+
+        需要同时满足：``provider_tts_settings.enable`` 为真，
+        且 MiMo provider 自身未被禁用（``enable=false``）。
+        """
+        info = self.native_tts_info()
+        if info.get("tts_enabled") != "1":
+            return False
+        return info.get("provider_enabled") != "0"
+
     def resolve_api_key(self) -> str:
-        """解析 API Key：配置 > 环境变量 > 凭证文件。"""
+        """解析 MiMo API Key（凭据优先级，开箱即用）。
+
+        优先级：
+        1. AstrBot 全局配置 ``cmd_config.json`` 中原生 MiMo TTS provider 的 ``api_key``
+           （用户在面板里已填过的 Key，直接复用，免二次配置）；
+        2. 插件自身配置 ``api_key``；
+        3. 环境变量 ``MIMO_API_KEY``；
+        4. 凭证文件 ``credentials_path``（默认 ``/data/apps/credentials/mimo.env``）。
+
+        Returns:
+            解析到的 Key；全部缺失时返回空字符串。
+        """
+        native_key = self.native_tts_info().get("api_key", "").strip()
+        if native_key:
+            return native_key
         if self._api_key_override:
             return self._api_key_override
-        import os
-
         env_key = os.environ.get("MIMO_API_KEY", "").strip()
         if env_key:
             return env_key
         return parse_env_file(self.credentials_path)
+
+    def resolve_api_key_source(self) -> str:
+        """描述当前 Key 的来源（供 /mimo状态 展示）。"""
+        native = self.native_tts_info()
+        if native.get("api_key"):
+            return f"AstrBot 原生配置（{native.get('provider_id') or 'mimo'}）"
+        if self._api_key_override:
+            return "插件配置 api_key"
+        if os.environ.get("MIMO_API_KEY", "").strip():
+            return "环境变量 MIMO_API_KEY"
+        if parse_env_file(self.credentials_path):
+            return f"凭证文件 {self.credentials_path}"
+        return "未配置"
+
+    def resolve_api_url(self) -> str:
+        """解析实际请求端点：插件显式配置 > 原生 provider api_base > 默认值。"""
+        configured = (self.api_url or "").strip()
+        if configured and configured != DEFAULT_API_URL:
+            return normalize_api_endpoint(configured)
+        native_base = self.native_tts_info().get("api_base", "").strip()
+        if native_base:
+            return normalize_api_endpoint(native_base)
+        return normalize_api_endpoint(configured or DEFAULT_API_URL)
 
     def build_voice_clone_ref(self) -> str:
         """构造 voiceclone 所需的 `data:audio/xxx;base64,...` 音色参考。"""
@@ -736,6 +1269,7 @@ class MiMoTTSPlugin(Star):
             or extracted_style
             or (self.state.get(session_id, "style") if session_id else "")
             or self.style_prefix
+            or self.default_style
         )
 
         body, truncated = clamp_text(body, self.max_text_length)
@@ -896,6 +1430,81 @@ class MiMoTTSPlugin(Star):
         task = asyncio.create_task(_worker())
         self._cleanup_tasks.add(task)
         task.add_done_callback(self._cleanup_tasks.discard)
+
+    # ---------------- 自动钩子：组件构造 ----------------
+
+    def platform_allowed(self, event: AstrMessageEvent) -> bool:
+        """当前平台是否在 target_platforms 白名单内（空表示全部）。"""
+        platform = (event.get_platform_name() or "").lower()
+        return not self.target_platforms or platform in self.target_platforms
+
+    async def build_voice_component(
+        self,
+        event: AstrMessageEvent,
+        wav_bytes: bytes,
+    ) -> tuple[Any | None, str]:
+        """把 MiMo WAV 字节转换为可拼进消息链的语音组件（不直接发送）。
+
+        与原 ``deliver_voice`` 的区别：本方法只负责「造组件」，由调用方决定
+        追加到结果链还是替换结果链，从而支持 `on_decorating_result` 钩子。
+
+        平台策略：
+        - aiocqhttp（NapCat/OneBot v11）：优先编码 Tencent SILK，发 Record 语音条；
+        - weixin_oc：出站不支持 Record，降级为 mp3 文件（File）；
+        - 其它平台：发 Record，由框架自行转换。
+
+        Args:
+            event: 消息事件（用于判断平台）。
+            wav_bytes: MiMo 返回的 WAV 音频字节。
+
+        Returns:
+            ``(component, note)``；失败时 component 为 None，note 为原因。
+        """
+        platform = (event.get_platform_name() or "").lower()
+        token = uuid.uuid4().hex[:12]
+        raw_path = self.cache_dir / f"mimo_{token}_raw.wav"
+        try:
+            await asyncio.to_thread(raw_path.write_bytes, wav_bytes)
+        except OSError as exc:
+            return None, f"写入临时音频失败：{exc}"
+
+        created: list[Path] = [raw_path]
+        try:
+            wav_path = await self.normalize_wav(raw_path, token)
+            if wav_path != raw_path:
+                created.append(wav_path)
+
+            if platform == "weixin_oc":
+                mp3_path = await self.to_mp3(wav_path, token)
+                if mp3_path != wav_path:
+                    created.append(mp3_path)
+                component = File(name=mp3_path.name, file=str(mp3_path))
+                note = "微信音频文件（原生语音条不支持，已降级）"
+            else:
+                audio_path = wav_path
+                if platform == "aiocqhttp" and self.qq_record_format in (
+                    "auto",
+                    "silk",
+                ):
+                    silk_path = await self.to_tencent_silk(wav_path, token)
+                    if silk_path is not None:
+                        audio_path = silk_path
+                        created.append(silk_path)
+                        logger.debug("[mimotts] 自动发声：已编码 SILK")
+                component = Record.fromFileSystem(str(audio_path))
+                note = "语音条" if platform == "aiocqhttp" else f"语音段({platform})"
+        except Exception as exc:  # noqa: BLE001 - 组件构造失败不应打断回复
+            logger.error(f"[mimotts] 构造语音组件失败：{exc}", exc_info=True)
+            for path in created:
+                try:
+                    await asyncio.to_thread(path.unlink, True)
+                except OSError:
+                    pass
+            return None, f"构造语音消息失败：{exc}"
+
+        # 给框架留足发送时间后再清理临时文件
+        self.schedule_cleanup(created, delay=120)
+        return component, note
 
     # ---------------- 多端语音发送 ----------------
 
@@ -1080,6 +1689,174 @@ class MiMoTTSPlugin(Star):
 
         return await self.deliver_voice(event, wav_bytes, caption=params.text)
 
+    # ---------------- 事件钩子：隐式 System Prompt 注入 ----------------
+
+    @filter.on_llm_request()
+    async def hook_inject_director_prompt(
+        self, event: AstrMessageEvent, req: Any
+    ) -> None:
+        """在 LLM 请求前注入 MiMo 标签指导词（幂等，不破坏原人设）。
+
+        只有「插件启用 + 自动发声开启 + 注入开关开启 + 平台命中」时才注入，
+        避免用户只使用指令功能时被无关提示词干扰。
+
+        Args:
+            event: 消息事件。
+            req: ``ProviderRequest``，其 ``system_prompt`` 可原地修改。
+        """
+        try:
+            if not (
+                self.enable and self.enable_auto_hook and self.enable_prompt_injection
+            ):
+                return
+            if not self.platform_allowed(event):
+                return
+
+            directive = self.prompt_injection_text or DEFAULT_PROMPT_INJECTION
+            current = str(getattr(req, "system_prompt", "") or "")
+            updated = inject_system_prompt(current, directive)
+            if updated != current:
+                req.system_prompt = updated
+                logger.debug(
+                    f"[mimotts] 已注入导演提示词（新增 {len(updated) - len(current)} 字符）"
+                )
+        except Exception as exc:  # noqa: BLE001 - 注入失败绝不能影响正常对话
+            logger.warning(f"[mimotts] 提示词注入失败（已忽略）：{exc}")
+
+    # ---------------- 事件钩子：LLM 回复拦截与自动发声 ----------------
+
+    def _warn_throttled(self, message: str) -> None:
+        """按固定间隔节流告警，避免逐条消息刷屏。"""
+        now = time.time()
+        if now - self._native_tts_warn_ts < NATIVE_TTS_WARN_INTERVAL:
+            return
+        self._native_tts_warn_ts = now
+        logger.warning(message)
+
+    async def _maybe_auto_speak(self, event: AstrMessageEvent) -> None:
+        """自动发声主流程（供 ``on_decorating_result`` 钩子调用）。
+
+        闸门顺序：启用 → 平台 → LLM 结果 → 非流式 → 未重复发声 → 无既有语音
+        → Markdown 清理 → 字数区间 → 概率 → 原生 TTS 冲突 → Key → 合成。
+        任何一步不通过都保持原有纯文本回复，绝不影响正常聊天。
+        """
+        if not (self.enable and self.enable_auto_hook):
+            return
+        if not self.platform_allowed(event):
+            logger.debug(
+                f"[mimotts] 自动发声跳过：平台 {event.get_platform_name()} 未启用"
+            )
+            return
+
+        result = event.get_result()
+        if result is None or not result.chain:
+            return
+        # 只处理 LLM 最终回复：指令输出（GENERAL_RESULT）不自动发声
+        if not result.is_llm_result():
+            logger.debug("[mimotts] 自动发声跳过：非 LLM 结果")
+            return
+        if result.result_content_type in (
+            ResultContentType.STREAMING_RESULT,
+            ResultContentType.STREAMING_FINISH,
+        ):
+            logger.debug("[mimotts] 自动发声跳过：流式输出暂不支持")
+            return
+        # mimo_speak 工具已在本轮发过语音 → 不重复
+        if event.get_extra(HOOK_SPOKEN_EXTRA_KEY):
+            logger.debug("[mimotts] 自动发声跳过：本轮已由 mimo_speak 工具发声")
+            return
+        # 结果链已有语音段（原生 TTS / 其它插件）→ 不重复
+        if any(isinstance(comp, Record) for comp in result.chain):
+            logger.debug("[mimotts] 自动发声跳过：结果链已含语音段")
+            return
+
+        raw_text = "".join(
+            str(getattr(comp, "text", "") or "")
+            for comp in result.chain
+            if isinstance(comp, Plain)
+        )
+        clean, reason = prepare_speech_candidate(
+            raw_text,
+            min_len=self.min_text_len,
+            max_len=self.max_text_len,
+        )
+        if reason:
+            logger.debug(f"[mimotts] 自动发声跳过：{reason} | 文本={clean[:40]!r}")
+            return
+
+        if not roll_probability(self.auto_speak_probability, self._rng):
+            logger.debug(
+                f"[mimotts] 自动发声跳过：概率未命中"
+                f"（p={self.auto_speak_probability:.2f}）"
+            )
+            return
+
+        # 「文字+语音」模式下，原生 TTS 会在本钩子之后再次处理 Plain 文本，
+        # 造成同一句话合成两次（双重扣费 + 重合发声），因此主动让位。
+        if (
+            self.send_mode == SEND_MODE_WITH_TEXT
+            and self.auto_hook_skip_if_native_tts
+            and self.native_tts_enabled()
+        ):
+            self._warn_throttled(
+                "[mimotts] 检测到 AstrBot 原生 TTS 仍启用：为避免双重扣费/重合发声，"
+                "本次自动发声已让位。请按 README《如何关闭 AstrBot 原生 TTS》关闭原生 TTS，"
+                "或将 send_mode 改为 voice_only。"
+            )
+            return
+
+        if not self.resolve_api_key():
+            self._warn_throttled(
+                "[mimotts] 未解析到 MiMo API Key，自动发声不可用："
+                "请在 AstrBot 面板配置原生 MiMo TTS provider，或在插件配置 api_key。"
+            )
+            return
+
+        params = self.prepare_params(clean, session_id=event.get_session_id())
+        if not params.text:
+            logger.debug("[mimotts] 自动发声跳过：参数整理后无正文")
+            return
+
+        try:
+            wav_bytes = await self.client.synthesize(params)
+        except MiMoTTSError as exc:
+            logger.warning(f"[mimotts] 自动发声合成失败，保持纯文本：{exc}")
+            return
+
+        component, note = await self.build_voice_component(event, wav_bytes)
+        if component is None:
+            logger.warning(f"[mimotts] 自动发声失败，保持纯文本：{note}")
+            return
+
+        if self.send_mode == SEND_MODE_VOICE_ONLY:
+            # 纯语音：移除文字段，保留图片/引用等非文本组件，避免丢内容
+            kept = [comp for comp in result.chain if not isinstance(comp, Plain)]
+            result.chain = kept + [component]
+            mode_note = "纯语音（已移除文字）"
+        else:
+            result.chain.append(component)
+            mode_note = "文字+语音"
+
+        logger.info(
+            f"[mimotts] 自动发声成功：{note} / {mode_note} / "
+            f"{speech_length(clean)} 字 / 音色={params.voice}"
+        )
+
+    @filter.on_decorating_result()
+    async def hook_auto_speak_on_decorating(self, event: AstrMessageEvent) -> None:
+        """LLM 回复发送前拦截：命中条件时自动合成语音并附加到消息链。
+
+        对应 AstrBot 事件钩子 ``OnDecoratingResultEvent``，此时消息尚未发出，
+        可以安全地改写 ``event.get_result().chain``。
+        """
+        try:
+            await self._maybe_auto_speak(event)
+        except Exception as exc:  # noqa: BLE001 - 钩子异常不能吞掉正常回复
+            logger.error(
+                f"[mimotts] 自动发声钩子异常（已忽略，不影响回复）：{exc}",
+                exc_info=True,
+            )
+
     @staticmethod
     def extract_quoted_text(event: AstrMessageEvent) -> str:
         """提取引用消息（回复）里的纯文本。"""
@@ -1213,23 +1990,38 @@ class MiMoTTSPlugin(Star):
         """查看插件运行状态：/mimo状态"""
         session_id = event.get_session_id()
         key = self.resolve_api_key()
+        native = self.native_tts_info(force=True)
         cache_files = (
             len(list(self.cache_dir.glob("mimo_*"))) if self.cache_dir.is_dir() else 0
         )
         platform = (event.get_platform_name() or "").lower()
+        native_state = "启用" if native.get("tts_enabled") == "1" else "未启用"
+        native_provider = native.get("provider_id") or native.get("tts_provider_id") or "-"
         lines = [
             "【MiMo TTS 状态】",
             f"· 启用：{'是' if self.enable else '否'}",
+            f"· 自动发声：{'开启' if self.enable_auto_hook else '关闭'}"
+            f"（概率 {self.auto_speak_probability:.2f}，模式 {self.send_mode}，"
+            f"字数 {self.min_text_len}~{self.max_text_len}）",
+            f"· 提示词注入：{'开启' if self.enable_prompt_injection else '关闭'}",
             f"· 模型：{self.model}",
             f"· 默认音色：{self.default_voice}（本会话：{self.state.get(session_id, 'voice', self.default_voice)}）",
-            f"· 默认风格：{self.state.get(session_id, 'style') or self.style_prefix or '未设置'}",
+            f"· 默认风格：{self.state.get(session_id, 'style') or self.style_prefix or self.default_style or '未设置'}",
             f"· 动作标签：{'开启' if self.enable_audio_tags else '关闭'}",
-            f"· API Key：{'已配置' if key else '缺失'}",
+            f"· API Key：{'已配置' if key else '缺失'}（来源：{self.resolve_api_key_source()}）",
+            f"· 请求端点：{self.resolve_api_url()}",
+            f"· 原生 TTS：{native_state}（provider={native_provider}）",
+            f"· 原生配置：{native.get('config_path') or '未找到 cmd_config.json'}",
             f"· 当前平台：{platform or '未知'}（启用列表：{', '.join(self.target_platforms) or '全部'}）",
             f"· ffmpeg：{'可用' if self._ffmpeg_path else '缺失'}",
             f"· 微信语音策略：{self.weixin_voice_mode}；QQ 录音格式：{self.qq_record_format}",
             f"· 临时音频：{cache_files} 个（TTL {self.temp_ttl_seconds}s）",
         ]
+        if native.get("tts_enabled") == "1" and self.send_mode == SEND_MODE_WITH_TEXT:
+            lines.append(
+                "· ⚠️ 原生 TTS 与「文字+语音」并存会导致重合发声，"
+                "请按 README 关闭原生 TTS，或改用 voice_only。"
+            )
         yield event.plain_result("\n".join(lines))
 
     @filter.command("mimo帮助", alias={"mimo_help"})
@@ -1242,6 +2034,11 @@ class MiMoTTSPlugin(Star):
             "· /mimo音色 [名称]      查看/切换音色\n"
             "· /mimo风格 [风格词]    查看/设置默认风格\n"
             "· /mimo状态             查看运行状态\n"
+            "\n自动语音（无需指令）：\n"
+            f"· 自动发声：{'开启' if self.enable_auto_hook else '关闭'}"
+            f"（概率 {self.auto_speak_probability:.2f}，模式 {self.send_mode}）\n"
+            f"· 字数闸门：{self.min_text_len}~{self.max_text_len} 字，"
+            "代码块/链接/加粗等 Markdown 会被自动清理\n"
             "\n文本语法（官方协议）：\n"
             "· 风格：`(温柔 撒娇)你好呀`，或写 `<style>温柔 撒娇</style>你好呀`（自动转换）\n"
             "· 动作标签：`你好呀[轻笑]`、`唉[叹气]`\n"
@@ -1269,5 +2066,7 @@ class MiMoTTSPlugin(Star):
             return "语音工具已关闭（enable_llm_tool=false）"
         ok, note = await self.handle_tts(event, text, voice=voice, style=style)
         if ok:
+            # 标记本轮已发声，避免 on_decorating_result 钩子对最终文本再发一次
+            event.set_extra(HOOK_SPOKEN_EXTRA_KEY, True)
             return f"语音已发送（{note}）"
         return f"语音发送失败：{note}"

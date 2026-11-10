@@ -1,14 +1,20 @@
 name: astrbot_plugin_mimotts
 display_name: MiMo 语音合成（微信 + NapCat QQ 原生语音条）
-desc: 调用小米 MiMo-V2.5-TTS 系列模型合成语音；严格遵循官方 messages 协议与 `(风格)` 标签语法，支持 `[轻笑]` 等动作标签；微信 / NapCat QQ（OneBot v11）双平台直发原生语音条，微信不支持时自动降级为音频文件。
+desc: 调用小米 MiMo-V2.5-TTS 系列模型合成语音；严格遵循官方 messages 协议与 `(风格)` 标签语法，支持 `[轻笑]` 等动作标签；微信 / NapCat QQ（OneBot v11）双平台直发原生语音条，微信不支持时自动降级为音频文件。v1.1.0 起支持 LLM 回复全自动发声钩子、概率/字数闸门、Markdown 清理与隐式导演提示词注入，并自动复用原生 TTS 已配置的 Key。
 short_desc: 小米 MiMo TTS 语音条（微信 + NapCat QQ）
 help: |
+  【自动语音（默认开启）】
+    · LLM 每条最终回复会按概率自动合成语音，无需任何指令
+    · 概率 / 字数区间 / 发送模式均可在插件配置中调整
+    · 代码块、链接、加粗等 Markdown 会被自动清理，不会朗读出来
+    · 自动复用 AstrBot 原生 MiMo TTS provider 的 Key（免二次配置）
+
   【指令】
     · /mimo <文本>         合成并发送语音条
     · /mimo引用            朗读被引用的消息（先引用一条文本消息）
     · /mimo音色 [名称]     查看 / 切换本会话音色（发送「重置」恢复默认）
     · /mimo风格 [风格词]   查看 / 设置本会话默认风格（发送「重置」清除）
-    · /mimo状态            查看模型、Key、平台、ffmpeg、临时文件等状态
+    · /mimo状态            查看模型、Key 来源、原生 TTS 冲突、自动发声等状态
     · /mimo帮助            显示本帮助
 
   【文本语法（MiMo 官方协议）】
@@ -19,7 +25,7 @@ help: |
     · 风格与导演指令走 role=user（不发音），朗读正文走 role=assistant
 
   【音色】
-    内置：mimo_default、冰糖、茉莉、苏打、白桦、Mia、Chloe、Milo、Dean
+    内置：冰糖、茉莉、苏打、白桦、Mia、Chloe、Milo、Dean（及别名 mimo_default）
     VoiceDesign（mimo-v2.5-tts-voicedesign）：用 voice_design_prompt 描述音色
     VoiceClone（mimo-v2.5-tts-voiceclone）：在 voice_sample_path 指定 mp3/wav 样本
 
@@ -29,10 +35,14 @@ help: |
       通道构造 voice_item（实验性），失败自动降级为 mp3 音频文件，不会丢消息
     · QQ 官方机器人等：直接发送 Record，由框架转 tencent_silk
 
+  【重要：避免双重扣费】
+    本插件与 AstrBot 原生 TTS 功能重叠。请在管理面板关闭原生 TTS，
+    详见 README《如何关闭 AstrBot 原生 TTS 避免双重扣费与重合发声》。
+
   【依赖】
     · ffmpeg（推荐）：用于统一 24kHz/单声道、生成 mp3，缺失时直接使用 MiMo 原始 WAV
     · pysilk（可选）：启用后可自行编码 Tencent SILK，QQ 语音兼容性更好
-version: v1.0.0
+version: v1.1.0
 author: CodeSmith
 repo: https://github.com/Zyw052/astrbot_plugin_mimotts
 astrbot_version: ">=4.13.0"

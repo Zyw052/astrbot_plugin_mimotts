@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -110,12 +111,16 @@ def test_parse_env_file(tmp: Path) -> None:
 
 
 def _schema_defaults() -> dict:
-    return {
+    cfg = {
         k: v.get("default")
         for k, v in json.loads(
             (PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8")
         ).items()
     }
+    # 单测隔离：不读取宿主真实的 AstrBot 配置 / 环境变量，保证结果确定
+    cfg["native_config_path"] = str(PLUGIN_DIR / "__no_such_cmd_config__.json")
+    os.environ.pop("MIMO_API_KEY", None)
+    return cfg
 
 
 def test_schema_defaults_cover_code() -> None:
@@ -161,6 +166,8 @@ class FakeEvent:
         self.sent: list = []
         self.message_str = ""
         self.message_obj = type("Obj", (), {"message": []})()
+        self._extras: dict = {}
+        self._result = None
 
     def get_platform_name(self) -> str:
         return self._platform
@@ -171,8 +178,31 @@ class FakeEvent:
     def get_sender_id(self) -> str:
         return "10001"
 
+    def set_extra(self, key, value) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key=None, default=None):
+        return self._extras.get(key, default)
+
+    def get_result(self):
+        return self._result
+
+    def set_result(self, result) -> None:
+        self._result = result
+
     async def send(self, chain) -> None:
         self.sent.append(chain)
+
+
+class FakeResult:
+    """最小 MessageEventResult 替身（只实现钩子用到的字段）。"""
+
+    def __init__(self, chain: list, content_type=None) -> None:
+        self.chain = chain
+        self.result_content_type = content_type or mod.ResultContentType.LLM_RESULT
+
+    def is_llm_result(self) -> bool:
+        return self.result_content_type == mod.ResultContentType.LLM_RESULT
 
 
 def _make_wav(tmp: Path) -> bytes:
@@ -259,6 +289,428 @@ def test_session_state_roundtrip(tmp: Path) -> None:
 
     asyncio.run(store2.set("s1", "voice", ""))
     assert store2.get("s1", "voice", "冰糖") == "冰糖"
+
+
+# --------------------------------------------------------------------------- #
+# v1.1.0 自动语音架构：纯函数单测
+# --------------------------------------------------------------------------- #
+
+
+def test_strip_markdown_for_speech() -> None:
+    raw = (
+        "## 标题\n"
+        "**加粗** 和 `code` 以及 ~~删除~~\n"
+        "```python\nprint('x')\n```\n"
+        "[链接](https://a.com) https://b.com\n"
+        "- 列表项\n"
+        "> 引用\n"
+        "[轻笑]呀"
+    )
+    got = mod.strip_markdown_for_speech(raw)
+    for bad in ("```", "##", "**", "~~", "https://", "[链接]", "- 列表", "> "):
+        assert bad not in got, f"残留 {bad!r}: {got!r}"
+    # 链接文字保留、动作标签原样保留
+    assert "加粗" in got and "链接" in got and "列表项" in got
+    assert "[轻笑]呀" in got
+    assert "\n \n" not in got
+
+
+def test_speech_length_ignores_tags_and_spaces() -> None:
+    assert mod.speech_length("[轻笑]好的") == 2
+    assert mod.speech_length(" 你 好 ") == 2
+    assert mod.speech_length("[叹气]") == 0
+    assert mod.speech_length("") == 0
+
+
+def test_prepare_speech_candidate_gates() -> None:
+    # 正常
+    assert mod.prepare_speech_candidate("好的", min_len=2, max_len=200) == ("好的", "")
+    # 空
+    clean, reason = mod.prepare_speech_candidate("   ", min_len=2, max_len=200)
+    assert clean == "" and reason, reason
+    # 只有动作标签
+    _clean, reason = mod.prepare_speech_candidate("[轻笑]", min_len=2, max_len=200)
+    assert "发音" in reason, reason
+    # 过短
+    _clean, reason = mod.prepare_speech_candidate("嗯", min_len=2, max_len=200)
+    assert "过短" in reason, reason
+    # 过长（跳过而非截断）
+    _clean, reason = mod.prepare_speech_candidate("字" * 11, min_len=2, max_len=10)
+    assert "过长" in reason, reason
+    # 0 表示不限制
+    assert mod.prepare_speech_candidate("好", min_len=0, max_len=0) == ("好", "")
+
+
+def test_roll_probability_bounds_and_seed() -> None:
+    import random
+
+    assert mod.roll_probability(0.0) is False
+    assert mod.roll_probability(1.0) is True
+    assert mod.roll_probability(-3) is False
+    assert mod.roll_probability(9) is True
+    rng = random.Random(2024)
+    hits = sum(mod.roll_probability(0.5, rng) for _ in range(400))
+    assert 120 < hits < 280, hits
+
+
+def test_inject_system_prompt_idempotent() -> None:
+    base = "你是猫娘，称呼用户为主人。"
+    got = mod.inject_system_prompt(base, "使用 (风格) 与 [轻笑]")
+    assert got.startswith(base), got
+    assert mod.PROMPT_INJECTION_MARKER in got
+    # 再次注入必须完全不变
+    assert mod.inject_system_prompt(got, "使用 (风格) 与 [轻笑]") == got
+    # 空 system_prompt
+    empty = mod.inject_system_prompt("", "使用标签")
+    assert empty.startswith(mod.PROMPT_INJECTION_MARKER)
+    # 空指令不改动
+    assert mod.inject_system_prompt(base, "  ") == base
+
+
+def test_normalize_api_endpoint() -> None:
+    assert (
+        mod.normalize_api_endpoint("https://api.xiaomimimo.com/v1")
+        == "https://api.xiaomimimo.com/v1/chat/completions"
+    )
+    full = "https://x.test/v1/chat/completions"
+    assert mod.normalize_api_endpoint(full) == full
+    assert mod.normalize_api_endpoint("") == mod.DEFAULT_API_URL
+    assert mod.normalize_api_endpoint("https://x.test/v1/") == (
+        "https://x.test/v1/chat/completions"
+    )
+
+
+def test_parse_native_tts_config() -> None:
+    data = {
+        "provider_tts_settings": {"enable": True, "provider_id": "mimo_tts"},
+        "provider": [
+            {
+                "id": "mimo_chat",
+                "provider": "xiaomi",
+                "provider_type": "chat_completion",
+                "api_key": "sk-chat-must-ignore",
+            },
+            {
+                "id": "mimo_tts",
+                "type": "mimo_tts_api",
+                "provider_type": "text_to_speech",
+                "api_key": "sk-native",
+                "api_base": "https://api.xiaomimimo.com/v1",
+                "model": "mimo-v2.5-tts",
+                "mimo-tts-voice": "茉莉",
+                "mimo-tts-style-prompt": "甜蜜撒娇",
+                "enable": True,
+            },
+        ],
+    }
+    info = mod.parse_native_tts_config(data)
+    assert info["api_key"] == "sk-native"
+    assert info["api_base"] == "https://api.xiaomimimo.com/v1"
+    assert info["model"] == mod.MODEL_TTS
+    assert info["voice"] == "茉莉"
+    assert info["style_prompt"] == "甜蜜撒娇"
+    assert info["provider_id"] == "mimo_tts"
+    assert info["tts_enabled"] == "1"
+    assert info["provider_enabled"] == "1"
+
+    # provider 缺失时回退 provider_sources，且兼容 "['sk-x']" 写法
+    fallback = mod.parse_native_tts_config(
+        {
+            "provider": [],
+            "provider_sources": [
+                {
+                    "id": "mimo_tts",
+                    "type": "mimo_tts_api",
+                    "api_key": "['sk-from-source']",
+                    "api_base": "https://api.xiaomimimo.com/v1",
+                }
+            ],
+        }
+    )
+    assert fallback["api_key"] == "sk-from-source"
+
+
+# --------------------------------------------------------------------------- #
+# v1.1.0 自动语音架构：插件行为单测
+# --------------------------------------------------------------------------- #
+
+
+def _make_plugin(**overrides):
+    cfg = _schema_defaults()
+    cfg["api_key"] = "sk-unit-test"
+    cfg.update(overrides)
+    return mod.MiMoTTSPlugin(context=object(), config=cfg)
+
+
+def _fake_audio_plugin(tmp: Path, **overrides):
+    """返回 (plugin, calls)，并把合成替换为本地静音 WAV（不联网）。"""
+    plugin = _make_plugin(**overrides)
+    wav = _make_wav(tmp)
+    calls: list = []
+
+    async def fake_synthesize(params):
+        calls.append(params)
+        return wav
+
+    plugin.client.synthesize = fake_synthesize
+    # 避免 asyncio.run 结束时残留后台清理任务
+    plugin.schedule_cleanup = lambda paths, delay=60: None
+    return plugin, calls
+
+
+def test_native_tts_key_reuse_priority(tmp: Path) -> None:
+    native = tmp / "cmd_config.json"
+    native.write_text(
+        json.dumps(
+            {
+                "provider_tts_settings": {"enable": True, "provider_id": "mimo_tts"},
+                "provider": [
+                    {
+                        "id": "mimo_tts",
+                        "provider_type": "text_to_speech",
+                        "api_key": "sk-native",
+                        "api_base": "https://native.example/v1",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    plugin = _make_plugin(api_key="sk-plugin", native_config_path=str(native))
+    assert plugin.resolve_api_key() == "sk-native"
+    assert plugin.resolve_api_url() == "https://native.example/v1/chat/completions"
+    assert "原生配置" in plugin.resolve_api_key_source()
+    assert plugin.native_tts_enabled() is True
+
+    # 插件显式 api_url 优先于原生 api_base
+    plugin2 = _make_plugin(
+        api_key="sk-plugin",
+        native_config_path=str(native),
+        api_url="https://custom.example/v1",
+    )
+    assert plugin2.resolve_api_url() == "https://custom.example/v1/chat/completions"
+
+    # 原生缺失 → 回落插件 key
+    plugin3 = _make_plugin(api_key="sk-plugin")
+    assert plugin3.resolve_api_key() == "sk-plugin"
+
+
+def test_prompt_injection_hook() -> None:
+    plugin = _make_plugin(enable_prompt_injection=True)
+    event = FakeEvent("aiocqhttp")
+    req = type("Req", (), {"system_prompt": "你是猫娘，称呼主人。"})()
+    asyncio.run(plugin.hook_inject_director_prompt(event, req))
+    first = req.system_prompt
+    assert first.startswith("你是猫娘，称呼主人。")
+    assert mod.PROMPT_INJECTION_MARKER in first
+    # 幂等
+    asyncio.run(plugin.hook_inject_director_prompt(event, req))
+    assert req.system_prompt == first
+
+    # 关闭注入 → 不改动
+    plugin_off = _make_plugin(enable_prompt_injection=False)
+    req2 = type("Req", (), {"system_prompt": "原人设"})()
+    asyncio.run(plugin_off.hook_inject_director_prompt(event, req2))
+    assert req2.system_prompt == "原人设"
+
+    # 平台不匹配 → 不注入
+    plugin_plat = _make_plugin(target_platforms=["weixin_oc"])
+    req3 = type("Req", (), {"system_prompt": "原人设"})()
+    asyncio.run(plugin_plat.hook_inject_director_prompt(event, req3))
+    assert req3.system_prompt == "原人设"
+
+
+def test_auto_hook_appends_voice_with_text(tmp: Path) -> None:
+    plugin, calls = _fake_audio_plugin(
+        tmp, auto_speak_probability=1.0, send_mode="voice_with_text"
+    )
+    event = FakeEvent("aiocqhttp")
+    result = FakeResult([mod.Plain("**你好**呀[轻笑]")])
+    event.set_result(result)
+
+    asyncio.run(plugin._maybe_auto_speak(event))
+
+    assert calls, "应当调用合成"
+    assert calls[0].text == "你好呀[轻笑]", calls[0].text
+    assert any(isinstance(c, mod.Record) for c in event.get_result().chain)
+    assert any(isinstance(c, mod.Plain) for c in event.get_result().chain)
+    asyncio.run(plugin.cleanup_temp_files(force_all=True))
+
+
+def test_auto_hook_voice_only_removes_text_keeps_media(tmp: Path) -> None:
+    plugin, calls = _fake_audio_plugin(
+        tmp, auto_speak_probability=1.0, send_mode="voice_only"
+    )
+    event = FakeEvent("aiocqhttp")
+    marker = object()
+    event.set_result(FakeResult([mod.Plain("你好呀"), marker]))
+
+    asyncio.run(plugin._maybe_auto_speak(event))
+
+    chain = event.get_result().chain
+    assert calls
+    assert marker in chain, "非文本组件必须保留"
+    assert not any(isinstance(c, mod.Plain) for c in chain)
+    assert any(isinstance(c, mod.Record) for c in chain)
+    asyncio.run(plugin.cleanup_temp_files(force_all=True))
+
+
+def test_auto_hook_gates_skip_without_voice(tmp: Path) -> None:
+    # 概率 0
+    plugin, calls = _fake_audio_plugin(tmp, auto_speak_probability=0.0)
+    event = FakeEvent("aiocqhttp")
+    event.set_result(FakeResult([mod.Plain("你好呀")]))
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert not calls
+
+    # 过短
+    plugin, calls = _fake_audio_plugin(
+        tmp, auto_speak_probability=1.0, min_text_len=2
+    )
+    event = FakeEvent("aiocqhttp")
+    event.set_result(FakeResult([mod.Plain("嗯")]))
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert not calls
+
+    # 过长
+    plugin, calls = _fake_audio_plugin(
+        tmp, auto_speak_probability=1.0, max_text_len=5
+    )
+    event = FakeEvent("aiocqhttp")
+    event.set_result(FakeResult([mod.Plain("字" * 6)]))
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert not calls
+
+    # 非 LLM 结果
+    plugin, calls = _fake_audio_plugin(tmp, auto_speak_probability=1.0)
+    event = FakeEvent("aiocqhttp")
+    event.set_result(
+        FakeResult([mod.Plain("指令输出")], content_type=mod.ResultContentType.GENERAL_RESULT)
+    )
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert not calls
+
+    # 本轮已通过工具发声
+    plugin, calls = _fake_audio_plugin(tmp, auto_speak_probability=1.0)
+    event = FakeEvent("aiocqhttp")
+    event.set_extra(mod.HOOK_SPOKEN_EXTRA_KEY, True)
+    event.set_result(FakeResult([mod.Plain("你好呀")]))
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert not calls
+
+
+def test_auto_hook_respects_native_tts(tmp: Path) -> None:
+    native = tmp / "cmd_config.json"
+    native.write_text(
+        json.dumps(
+            {
+                "provider_tts_settings": {"enable": True, "provider_id": "mimo_tts"},
+                "provider": [
+                    {
+                        "id": "mimo_tts",
+                        "provider_type": "text_to_speech",
+                        "api_key": "sk-native",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # 文字+语音 + 原生 TTS 启用 → 让位
+    plugin, calls = _fake_audio_plugin(
+        tmp,
+        auto_speak_probability=1.0,
+        send_mode="voice_with_text",
+        native_config_path=str(native),
+    )
+    event = FakeEvent("aiocqhttp")
+    event.set_result(FakeResult([mod.Plain("你好呀")]))
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert not calls, "原生 TTS 启用时应让位，避免双重扣费"
+
+    # 纯语音模式 + 原生 TTS 启用 → 允许（原生 TTS 只处理 Plain）
+    plugin, calls = _fake_audio_plugin(
+        tmp,
+        auto_speak_probability=1.0,
+        send_mode="voice_only",
+        native_config_path=str(native),
+    )
+    event = FakeEvent("aiocqhttp")
+    event.set_result(FakeResult([mod.Plain("你好呀")]))
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert calls
+    asyncio.run(plugin.cleanup_temp_files(force_all=True))
+
+    # provider 自身 enable=false（即使总开关为 true）→ 视为原生未启用
+    native_off = tmp / "cmd_config_off.json"
+    native_off.write_text(
+        json.dumps(
+            {
+                "provider_tts_settings": {"enable": True, "provider_id": "mimo_tts"},
+                "provider": [
+                    {
+                        "id": "mimo_tts",
+                        "provider_type": "text_to_speech",
+                        "api_key": "sk-native",
+                        "enable": False,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    plugin, calls = _fake_audio_plugin(
+        tmp,
+        auto_speak_probability=1.0,
+        send_mode="voice_with_text",
+        native_config_path=str(native_off),
+    )
+    event = FakeEvent("aiocqhttp")
+    event.set_result(FakeResult([mod.Plain("你好呀")]))
+    asyncio.run(plugin._maybe_auto_speak(event))
+    assert calls, "provider 已被禁用时不应误判为原生 TTS 冲突"
+    asyncio.run(plugin.cleanup_temp_files(force_all=True))
+
+
+def test_llm_tool_marks_turn_spoken(tmp: Path) -> None:
+    plugin, _calls = _fake_audio_plugin(tmp)
+
+    async def fake_handle(event, text, **kwargs):
+        return True, "ok"
+
+    plugin.handle_tts = fake_handle
+    event = FakeEvent("aiocqhttp")
+    out = asyncio.run(plugin.llm_mimo_speak(event, "你好"))
+    assert "已发送" in out, out
+    assert event.get_extra(mod.HOOK_SPOKEN_EXTRA_KEY) is True
+
+
+def test_schema_declares_required_keys() -> None:
+    schema = json.loads(
+        (PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    required = {
+        "enable_auto_hook": "bool",
+        "auto_speak_probability": "float",
+        "send_mode": "string",
+        "default_voice": "string",
+        "default_style": "string",
+        "enable_prompt_injection": "bool",
+        "max_text_len": "int",
+        "min_text_len": "int",
+    }
+    for key, typ in required.items():
+        assert key in schema, f"缺少配置项 {key}"
+        assert schema[key]["type"] == typ, f"{key} 类型错误"
+        assert "default" in schema[key], f"{key} 缺少默认值"
+    # 音色下拉必须包含全部内置音色
+    for voice in ("冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"):
+        assert voice in schema["default_voice"]["options"], voice
+    assert schema["send_mode"]["options"] == ["voice_with_text", "voice_only"]
+    assert schema["auto_speak_probability"]["default"] == 0.6
+    assert schema["max_text_len"]["default"] == 200
+    assert schema["min_text_len"]["default"] == 2
 
 
 # --------------------------------------------------------------------------- #

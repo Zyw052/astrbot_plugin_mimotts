@@ -3,17 +3,95 @@
     "description": "启用插件",
     "type": "bool",
     "default": true,
-    "hint": "关闭后指令与 LLM 工具都不再生效"
+    "hint": "关闭后指令、LLM 工具与自动发声钩子都不再生效"
+  },
+  "enable_auto_hook": {
+    "description": "启用全局自动发声",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，LLM 的每条最终回复都会按概率/字数规则自动合成语音（无需模型调用工具）"
+  },
+  "auto_speak_probability": {
+    "description": "自动发声触发概率",
+    "type": "float",
+    "default": 0.6,
+    "hint": "0.0 ~ 1.0。1.0=每条都发声，0.0=从不发声。较长回复建议 0.4~0.7，避免刷屏"
+  },
+  "send_mode": {
+    "description": "语音发送模式",
+    "type": "string",
+    "default": "voice_with_text",
+    "options": ["voice_with_text", "voice_only"],
+    "hint": "voice_with_text=保留文字并追加语音条；voice_only=只发语音（移除文字，保留图片/引用）"
+  },
+  "default_voice": {
+    "description": "默认音色",
+    "type": "string",
+    "default": "冰糖",
+    "options": [
+      "冰糖",
+      "茉莉",
+      "苏打",
+      "白桦",
+      "Mia",
+      "Chloe",
+      "Milo",
+      "Dean",
+      "mimo_default"
+    ],
+    "hint": "仅 mimo-v2.5-tts 生效；mimo_default 在国内集群为冰糖，其它集群为 Mia"
+  },
+  "default_style": {
+    "description": "兜底风格",
+    "type": "string",
+    "default": "温柔 撒娇",
+    "hint": "未设置会话风格、文本也无 (风格) 前缀时使用；留空表示不加风格。例：温柔 撒娇"
+  },
+  "enable_prompt_injection": {
+    "description": "注入导演提示词",
+    "type": "bool",
+    "default": true,
+    "hint": "自动向 system prompt 追加轻量指导词，教 LLM 使用 (风格) 前缀与 [轻笑] 等动作标签；幂等，不破坏原人设"
+  },
+  "max_text_len": {
+    "description": "自动发声最大字数",
+    "type": "int",
+    "default": 200,
+    "hint": "自动钩子专用：超过该字数直接跳过（不截断），避免长时间播报；<=0 不限制"
+  },
+  "min_text_len": {
+    "description": "自动发声最小字数",
+    "type": "int",
+    "default": 2,
+    "hint": "自动钩子专用：短于该字数跳过（如「嗯」「好的」可设为 3 以上来忽略）；<=0 不限制"
+  },
+  "prompt_injection_text": {
+    "description": "自定义导演提示词（留空用内置）",
+    "type": "text",
+    "default": "",
+    "hint": "留空使用内置指导词；自定义时仍会自动带 [MiMo-TTS] 幂等标记"
+  },
+  "auto_hook_skip_if_native_tts": {
+    "description": "原生 TTS 启用时让位（防双重扣费）",
+    "type": "bool",
+    "default": true,
+    "hint": "「文字+语音」模式下，若 AstrBot 原生 TTS 仍启用，自动发声会跳过并告警，避免同一句话合成两次；建议按 README 关闭原生 TTS"
+  },
+  "native_config_path": {
+    "description": "AstrBot 配置文件路径（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "留空时自动探测 data/cmd_config.json；仅在自动探测失败时手动指定"
   },
   "api_key": {
     "description": "MiMo API Key",
     "type": "string",
     "default": "",
-    "obvious_hint": true,
-    "hint": "留空时依次回落：环境变量 MIMO_API_KEY → credentials_path 指向的文件。格式 sk-xxxxx"
+    "hint": "留空时优先复用 AstrBot 原生 MiMo TTS provider 的 Key，其次回落环境变量 MIMO_API_KEY → credentials_path。格式 sk-xxxxx",
+    "obvious_hint": true
   },
   "credentials_path": {
-    "description": "凭证文件路径（api_key 留空时读取）",
+    "description": "凭证文件路径（兜底）",
     "type": "string",
     "default": "/data/apps/credentials/mimo.env",
     "hint": "支持 .env 格式（MIMO_API_KEY=sk-xxx）或仅一行裸 Key"
@@ -22,7 +100,7 @@
     "description": "API 地址",
     "type": "string",
     "default": "https://api.xiaomimimo.com/v1/chat/completions",
-    "hint": "OpenAI 兼容协议；Token Plan / 批量推理需换成对应 Base URL"
+    "hint": "留空或保持默认时会自动复用原生 provider 的 api_base；OpenAI 兼容协议"
   },
   "model": {
     "description": "TTS 模型",
@@ -34,23 +112,6 @@
       "mimo-v2.5-tts-voiceclone"
     ],
     "hint": "mimo-v2.5-tts=内置音色；voicedesign=文字描述生成音色；voiceclone=音频样本复刻音色"
-  },
-  "default_voice": {
-    "description": "默认音色",
-    "type": "string",
-    "default": "冰糖",
-    "options": [
-      "mimo_default",
-      "冰糖",
-      "茉莉",
-      "苏打",
-      "白桦",
-      "Mia",
-      "Chloe",
-      "Milo",
-      "Dean"
-    ],
-    "hint": "仅 mimo-v2.5-tts 生效；mimo_default 在国内集群为冰糖，其它集群为 Mia"
   },
   "voice_design_prompt": {
     "description": "VoiceDesign 音色描述",
@@ -78,10 +139,10 @@
     "hint": "仅当样本文件无扩展名时用于推断 MIME"
   },
   "style_prefix": {
-    "description": "默认风格前缀",
+    "description": "默认风格前缀（旧版兼容）",
     "type": "string",
     "default": "",
-    "hint": "例如「温柔 撒娇」，会以官方 `(温柔 撒娇)正文` 形式放在 assistant 文本最开头"
+    "hint": "优先级高于 default_style；例如「温柔 撒娇」，会以官方 `(温柔 撒娇)正文` 形式拼装"
   },
   "style_instruction": {
     "description": "默认自然语言风格指令",
@@ -106,7 +167,7 @@
     "type": "string",
     "default": "auto",
     "options": ["auto", "native_voice", "file"],
-    "hint": "auto=先试原生语音条，失败降级 mp3 文件；native_voice=只发语音条（失败报错）；file=直接发音频文件"
+    "hint": "auto=先试原生语音条，失败降级 mp3 文件；native_voice=只发语音条（失败报错）；file=直接发音频文件。自动钩子统一按 auto 语义降级为文件"
   },
   "weixin_voice_upload_type": {
     "description": "微信语音上传 media_type",
@@ -122,16 +183,16 @@
     "hint": "auto=有 pysilk 就编码 SILK，否则发 24kHz WAV 由 NapCat 转码；silk/wav=强制指定"
   },
   "send_text_caption": {
-    "description": "同时发送文字",
+    "description": "指令模式同时发送文字",
     "type": "bool",
     "default": false,
-    "hint": "开启后先发一条文字，再发语音"
+    "hint": "仅对 /mimo 指令与 mimo_speak 工具有效；自动钩子的文字留存由 send_mode 决定"
   },
   "max_text_length": {
-    "description": "单次朗读最大字数",
+    "description": "指令模式最大朗读字数",
     "type": "int",
     "default": 300,
-    "hint": "超出会截断并记录日志；<=0 表示不限制"
+    "hint": "仅对 /mimo 指令与 mimo_speak 工具有效：超出会截断；自动钩子请用 max_text_len（超限跳过）"
   },
   "request_timeout": {
     "description": "请求超时（秒）",
@@ -143,7 +204,7 @@
     "description": "启用 LLM 工具",
     "type": "bool",
     "default": true,
-    "hint": "注册 mimo_speak 工具，让模型能主动发语音条"
+    "hint": "注册 mimo_speak 工具，让模型能主动发语音条（与自动钩子互斥去重）"
   },
   "temp_ttl_seconds": {
     "description": "临时音频保留秒数",
@@ -155,6 +216,6 @@
     "description": "调试日志",
     "type": "bool",
     "default": false,
-    "hint": "打印请求体摘要（assistant 文本前 80 字）与 audio 参数"
+    "hint": "打印请求体摘要、自动发声闸门判定与 audio 参数"
   }
 }
