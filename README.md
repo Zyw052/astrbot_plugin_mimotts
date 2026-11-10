@@ -141,11 +141,11 @@ ffmpeg 缺失时：直接使用 MiMo 原始 WAV（本身已是 24kHz/mono），�
 
 ```bash
 # 1) 离线单测（13 项，无需网络，自带 runner，不依赖 pytest）
-cd /AstrBot && /AstrBot/.venv/bin/python \\
+cd /AstrBot && /AstrBot/.venv/bin/python \
     data/plugins/astrbot_plugin_mimotts/tests/test_units.py
 
 # 2) 真实 API 联调（会消耗额度；验证导入/实例化/合成/多端投递全链路）
-cd /AstrBot && /AstrBot/.venv/bin/python \\
+cd /AstrBot && /AstrBot/.venv/bin/python \
     data/plugins/astrbot_plugin_mimotts/tests/live_check.py
 ```
 
